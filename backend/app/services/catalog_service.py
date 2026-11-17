@@ -15,8 +15,15 @@ def dashboard() -> dict[str, Any]:
         day = settings_repo.get(conn, "business_day") or ""
         scope = scope_rules.normalize(settings_repo.get(conn, scope_rules.SETTING_KEY))
         summary = line_repo.day_summary(conn, day, scope) if day else None
-        sealed = close_repo.is_sealed(conn, day) if day else False
-        return {
+        # 只认真通过钉扎闭包校验的现行批；半截批不算已封，且问题要在总览可见。
+        sealed_batch = close_repo.get_sealed_batch_for_day(conn, day) if day else None
+        verdict = (
+            close_repo.verify_batch_closure(conn, sealed_batch)
+            if sealed_batch
+            else None
+        )
+        sealed = bool(verdict and verdict["ok"])
+        payload = {
             "business_day": day,
             "scope": scope,
             "scope_label": scope_rules.label(scope),
@@ -27,11 +34,14 @@ def dashboard() -> dict[str, Any]:
             "cash_line_count_today": summary["cash_line_count"] if summary else 0,
             "day_line_count_today": summary["day_line_count"] if summary else 0,
             "sealed_today": sealed,
+            "closure_ok": verdict["ok"] if verdict else None,
+            "closure_problems": verdict["problems"] if verdict else [],
             "close_batch_count": conn.execute("SELECT COUNT(*) c FROM close_batches").fetchone()["c"],
             "open_variance_count": conn.execute(
                 "SELECT COUNT(*) c FROM variance_rows WHERE disposition='pending'"
             ).fetchone()["c"],
         }
+        return payload
     finally:
         conn.close()
 

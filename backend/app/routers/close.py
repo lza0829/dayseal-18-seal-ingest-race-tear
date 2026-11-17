@@ -24,6 +24,12 @@ def batch(batch_id: int):
     return svc.get_batch(batch_id)
 
 
+@router.post("/batches/{batch_id}/void")
+def void_batch(batch_id: int, body: dict | None = Body(default=None)):
+    reason = (body or {}).get("reason")
+    return svc.void_batch(batch_id, reason)
+
+
 @router.get("/variances")
 def variances():
     return svc.list_variances()

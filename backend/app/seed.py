@@ -2,6 +2,7 @@ from __future__ import annotations
 import sqlite3
 
 from app import scope as scope_rules
+from app import seal_window
 from app.db import connect
 
 
@@ -41,9 +42,25 @@ CREATE TABLE IF NOT EXISTS close_batches (
   day_line_count INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL,
   sealed_at TEXT NOT NULL,
-  note TEXT
+  note TEXT,
+  scan_started_at TEXT,
+  closure_line_ids TEXT,
+  fingerprint TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_close_batches_day ON close_batches(business_day);
+-- 同一营业日至多一个现行（sealed）批次；作废/被取代批次不占位。
+-- 双封由写事务 + 进程门先行拦截，这里是落库级最后防线。
+CREATE UNIQUE INDEX IF NOT EXISTS idx_close_batches_one_sealed_per_day
+ON close_batches(business_day) WHERE status = 'sealed';
+-- 封账扫描/封账态的落库门：phase='scanning' 表示扫描闭包已切，
+-- 该营业日流水一律拒写；phase='sealed' 与 sealed 批次同在。
+-- 进程内门在崩溃等场景可能丢失，此表是跨连接/跨进程的事实来源。
+CREATE TABLE IF NOT EXISTS seal_state (
+  business_day TEXT PRIMARY KEY,
+  phase TEXT NOT NULL CHECK (phase IN ('scanning', 'sealed')),
+  batch_id INTEGER,
+  updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS close_batch_methods (
   id INTEGER PRIMARY KEY,
   batch_id INTEGER NOT NULL REFERENCES close_batches(id) ON DELETE CASCADE,
@@ -76,7 +93,38 @@ CREATE TABLE IF NOT EXISTS reopen_requests (
 
 # 封账后该营业日的有效流水禁止增、改、删。
 # 服务层已先做校验；触发器是第二道防线，直接改库也会被拒。
+# 两道关口：
+#   1) seal_state 存在（scanning 或 sealed）即拒——扫描开始即闭包，
+#      封账事务尚未提交 sealed 批次时也生效，堵住“扫描窗口”；
+#   2) 已存在 sealed 批次即拒——seal_state 缺失（被人工清表等）时兜底。
 GUARDS = '''
+CREATE TRIGGER IF NOT EXISTS trg_cash_lines_no_insert_during_seal
+BEFORE INSERT ON cash_lines
+WHEN EXISTS (
+  SELECT 1 FROM seal_state s WHERE s.business_day = NEW.business_day
+)
+BEGIN
+  SELECT RAISE(ABORT, '营业日封账扫描已开始，禁止新增流水');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_cash_lines_no_update_during_seal
+BEFORE UPDATE ON cash_lines
+WHEN EXISTS (
+  SELECT 1 FROM seal_state s WHERE s.business_day IN (OLD.business_day, NEW.business_day)
+)
+BEGIN
+  SELECT RAISE(ABORT, '营业日封账扫描已开始，禁止修改流水');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_cash_lines_no_delete_during_seal
+BEFORE DELETE ON cash_lines
+WHEN EXISTS (
+  SELECT 1 FROM seal_state s WHERE s.business_day = OLD.business_day
+)
+BEGIN
+  SELECT RAISE(ABORT, '营业日封账扫描已开始，禁止删除流水');
+END;
+
 CREATE TRIGGER IF NOT EXISTS trg_cash_lines_no_insert_when_sealed
 BEFORE INSERT ON cash_lines
 WHEN EXISTS (
@@ -110,7 +158,8 @@ END;
 CREATE TRIGGER IF NOT EXISTS trg_close_batches_lock_snapshot
 BEFORE UPDATE OF scope, system_total, cash_total, cash_line_count,
                   declared_cash, variance, line_count, day_line_count,
-                  business_day, batch_no, sealed_at
+                  business_day, batch_no, sealed_at,
+                  scan_started_at, closure_line_ids, fingerprint
 ON close_batches
 WHEN OLD.status = 'sealed'
 BEGIN
@@ -187,6 +236,33 @@ def _migrate(conn: sqlite3.Connection) -> None:
     _add_column(conn, "close_batches", "cash_line_count INTEGER NOT NULL DEFAULT 0", "cash_line_count")
     _add_column(conn, "close_batches", "day_line_count INTEGER NOT NULL DEFAULT 0", "day_line_count")
     _add_column(conn, "variance_rows", "scope TEXT NOT NULL DEFAULT 'cash_only'", "scope")
+    _add_column(conn, "close_batches", "scan_started_at TEXT", "scan_started_at")
+    _add_column(conn, "close_batches", "closure_line_ids TEXT", "closure_line_ids")
+    _add_column(conn, "close_batches", "fingerprint TEXT", "fingerprint")
+
+    # 历史 sealed 批次在旧版本没有钉扎清单/指纹：按当前库内该营业日流水
+    # 如实补算并标注，使其能通过与新批次同一条闭包校验。
+    legacy = conn.execute(
+        "SELECT id, business_day FROM close_batches "
+        "WHERE status='sealed' AND fingerprint IS NULL ORDER BY id"
+    ).fetchall()
+    for batch in legacy:
+        ids = [
+            int(r["id"])
+            for r in conn.execute(
+                "SELECT id FROM cash_lines WHERE business_day=? ORDER BY id",
+                (batch["business_day"],),
+            ).fetchall()
+        ]
+        conn.execute(
+            "UPDATE close_batches SET closure_line_ids=?, fingerprint=?, scan_started_at=sealed_at "
+            "WHERE id=?",
+            (
+                ",".join(str(i) for i in ids),
+                seal_window.fingerprint_for_ids(ids),
+                batch["id"],
+            ),
+        )
 
     if not scope_added:
         return
@@ -211,6 +287,39 @@ def _migrate(conn: sqlite3.Connection) -> None:
         )
         _backfill_cash_snapshot(conn, batch["id"], day)
         _backfill_method_breakdown(conn, batch["id"], day)
+
+
+def _rebuild_seal_state(conn: sqlite3.Connection) -> None:
+    """按现行 sealed 批次重建落库封账门（幂等）。
+
+    正常路径由封账事务维护 seal_state；这里负责升级旧库与崩溃恢复：
+    每个有现行 sealed 批次的营业日必须有一行 sealed 态，反之清除孤儿行
+    （含封账进程在 scanning 态崩溃后残留、会把该营业日永久锁死的扫描行）。
+    """
+    sealed_days = {
+        r["business_day"]
+        for r in conn.execute(
+            "SELECT DISTINCT business_day FROM close_batches WHERE status='sealed'"
+        ).fetchall()
+    }
+    known = {
+        r["business_day"]
+        for r in conn.execute("SELECT business_day FROM seal_state").fetchall()
+    }
+    for day in sealed_days - known:
+        batch = conn.execute(
+            "SELECT id, sealed_at FROM close_batches "
+            "WHERE business_day=? AND status='sealed' ORDER BY id LIMIT 1",
+            (day,),
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO seal_state(business_day, phase, batch_id, updated_at) "
+            "VALUES (?, 'sealed', ?, ?)",
+            (day, batch["id"], batch["sealed_at"]),
+        )
+    # 孤儿行：没有现行 sealed 批对应的状态（崩溃残留 scanning / 批次已作废）。
+    for day in known - sealed_days:
+        conn.execute("DELETE FROM seal_state WHERE business_day=?", (day,))
 
 
 def _backfill_cash_snapshot(conn: sqlite3.Connection, batch_id: int, day: str) -> None:
@@ -262,6 +371,7 @@ def seed_if_empty() -> None:
     try:
         conn.executescript(SCHEMA)
         _migrate(conn)
+        _rebuild_seal_state(conn)
         conn.executescript(GUARDS)
         ensure_scope_setting(conn)
         n = conn.execute("SELECT COUNT(*) c FROM tills").fetchone()["c"]

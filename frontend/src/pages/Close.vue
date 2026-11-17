@@ -26,6 +26,16 @@ async function seal() {
   } catch (e) { err.value = e.message }
 }
 
+async function voidBatch(b) {
+  err.value = ''
+  if (!window.confirm(`确认作废批次 ${b.batch_no}？作废后该营业日恢复可写，可按现行流水闭包重新封账。`)) return
+  try {
+    const r = await api.voidBatch(b.id)
+    msg.value = `批次 ${b.batch_no} 已作废：${r.problems.join('；')}`
+    await load()
+  } catch (e) { err.value = e.message }
+}
+
 function includedList(b) {
   return (b.methods || []).filter((m) => m.included).map((m) => `${m.pay_method} ${m.total.toFixed(2)}`).join(' · ') || '—'
 }
@@ -56,7 +66,15 @@ function alignRows(rows) {
       营业日 {{ preview.business_day }} ·
       口径 <span class="tag">{{ preview.scope_label }}</span>
       <span class="tag" :class="preview.sealed ? 'ok' : 'warn'">{{ preview.sealed ? '已封' : '未封' }}</span>
+      <span v-if="preview.scanning" class="tag warn">扫描闭包已切 · 写入冻结</span>
     </p>
+    <div v-if="preview.closure_ok === false" class="msg err">
+      现行批次未通过钉扎闭包校验，不得当现行：
+      <ul>
+        <li v-for="(p, i) in preview.closure_problems" :key="i">{{ p }}</li>
+      </ul>
+      请先作废该批次，再按现行流水闭包重新封账。
+    </div>
     <p class="msg">{{ preview.scope_description }}</p>
     <div class="stats scope-stats">
       <div class="stat"><div class="label">系统合计（{{ preview.scope_label }}）</div><div class="value">{{ preview.system_total.toFixed(2) }}</div></div>
@@ -79,7 +97,7 @@ function alignRows(rows) {
 
     <div class="row">
       <label>实盘现金 <input type="number" step="0.01" v-model.number="declared" /></label>
-      <button class="btn" :disabled="preview.sealed" @click="seal">封账</button>
+      <button class="btn" :disabled="preview.sealed || preview.scanning" @click="seal">封账</button>
       <button class="btn ghost" @click="load">刷新</button>
     </div>
   </div>
@@ -89,12 +107,10 @@ function alignRows(rows) {
   <div class="panel">
     <h2>封账批次</h2>
     <table>
-      <thead>
-        <tr>
-          <th>批次</th><th>营业日</th><th>口径</th><th>系统</th><th>现金笔数</th>
-          <th>实盘</th><th>差额</th><th>状态</th><th>可核分项</th>
-        </tr>
-      </thead>
+      <thead><tr>
+        <th>批次</th><th>营业日</th><th>口径</th><th>系统</th><th>现金笔数</th>
+        <th>实盘</th><th>差额</th><th>状态</th><th>闭包校验</th><th>可核分项</th><th></th>
+      </tr></thead>
       <tbody>
         <tr v-for="b in batches" :key="b.id">
           <td>{{ b.batch_no }}</td>
@@ -105,9 +121,22 @@ function alignRows(rows) {
           <td>{{ b.declared_cash.toFixed(2) }}</td>
           <td>{{ b.variance.toFixed(2) }}</td>
           <td>{{ b.status }}</td>
+          <td>
+            <span v-if="b.status !== 'sealed'" class="muted">—</span>
+            <span v-else-if="b.closure_ok" class="tag ok">闭包一致</span>
+            <span v-else class="tag warn" :title="(b.closure_problems || []).join('；')">半截批</span>
+          </td>
           <td class="mono">
             <div>计入：{{ includedList(b) }}</div>
             <div class="muted">未计：{{ excludedList(b) }}</div>
+            <div v-if="b.fingerprint" class="muted">指纹：{{ b.fingerprint.slice(0, 12) }}…</div>
+          </td>
+          <td>
+            <button
+              v-if="b.status === 'sealed' && b.closure_ok === false"
+              class="btn ghost"
+              @click="voidBatch(b)"
+            >作废重封</button>
           </td>
         </tr>
       </tbody>
